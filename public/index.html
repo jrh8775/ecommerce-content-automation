@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E-Commerce Content Automation</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header>
+        <h1>E-Commerce Content Automation Dashboard</h1>
+    </header>
+    <main>
+        <section>
+            <h2>Submit Product Details</h2>
+            <form id="productForm">
+                <label for="productName">Product Name:</label>
+                <input type="text" id="productName" name="productName" required>
+                <label for="productDescription">Product Description:</label>
+                <textarea id="productDescription" name="productDescription" required></textarea>
+                <button type="submit">Generate Content</button>
+            </form>
+            <div id="resultContainer" style="display:none;">
+                <h2>Generated Content</h2>
+                <p id="generatedContent"></p>
+            </div>
+        </section>
+        <script>
+            document.getElementById('productForm').addEventListener('submit', function(event) {
+                event.preventDefault();
+                const productName = document.getElementById('productName').value;
+                const productDescription = document.getElementById('productDescription').value;
+                const generatedContent = `Promotional Text for ${productName}: ${productDescription}`;
+                document.getElementById('generatedContent').innerText = generatedContent;
+                document.getElementById('resultContainer').style.display = 'block';
+            });
+        </script>
+    </main>
+</body>
+</html>
