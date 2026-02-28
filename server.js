@@ -4,6 +4,7 @@ const helmet = require('helmet');
 const dotenv = require('dotenv');
 const { google } = require('googleapis');
 const OpenAI = require('openai');
+const mockData = require('./test-mock-data');
 const {
   ValidationError,
   QuotaError,
@@ -17,6 +18,7 @@ const {
 dotenv.config();
 
 const app = express();
+const USE_MOCK = process.env.USE_MOCK === 'true';
 
 // Middleware
 app.use(helmet());
@@ -103,9 +105,13 @@ Label each variation clearly.
   `,
 };
 
-// Generate content using OpenAI
+// Generate content using OpenAI or mock data
 async function generateContent(contentType, productData) {
   try {
+    if (USE_MOCK) {
+      return mockData[contentType];
+    }
+
     const prompt = PROMPTS[contentType](productData);
     
     const response = await openai.chat.completions.create({
@@ -126,7 +132,6 @@ async function generateContent(contentType, productData) {
     
     return response.choices[0].message.content.trim();
   } catch (error) {
-    // Handle OpenAI specific errors
     if (error.status === 429) {
       throw new QuotaError();
     }
@@ -201,24 +206,20 @@ async function writeToSpreadsheet(spreadsheetId, range, values) {
 }
 
 // API Endpoints
-
-// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
+    mockMode: USE_MOCK,
   });
 });
 
-// Process products from Google Sheets
 app.post('/api/process-products', async (req, res, next) => {
   try {
     const { spreadsheetId, inputRange, outputRange } = req.body;
-
     validateSpreadsheetParams({ spreadsheetId, inputRange, outputRange });
 
-    // Read input data
     const rows = await readFromSpreadsheet(spreadsheetId, inputRange);
 
     if (!rows || rows.length === 0) {
@@ -229,11 +230,9 @@ app.post('/api/process-products', async (req, res, next) => {
       });
     }
 
-    // Skip header row
     const productRows = rows.slice(1);
     const results = [];
 
-    // Process each product
     for (const row of productRows) {
       const productData = {
         sku: row[0],
@@ -249,7 +248,6 @@ app.post('/api/process-products', async (req, res, next) => {
       results.push(result);
     }
 
-    // Prepare output data
     const outputData = results.map((result) => [
       result.productName,
       result.data.title || '',
@@ -260,7 +258,6 @@ app.post('/api/process-products', async (req, res, next) => {
       result.errors ? JSON.stringify(result.errors) : '',
     ]);
 
-    // Add header
     outputData.unshift([
       'Product Name',
       'Title',
@@ -271,13 +268,13 @@ app.post('/api/process-products', async (req, res, next) => {
       'Errors',
     ]);
 
-    // Write to spreadsheet
     await writeToSpreadsheet(spreadsheetId, outputRange, outputData);
 
     res.json({
       message: 'Products processed successfully',
       processed: productRows.length,
       results,
+      mockMode: USE_MOCK,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -285,13 +282,10 @@ app.post('/api/process-products', async (req, res, next) => {
   }
 });
 
-// Generate content for single product
 app.post('/api/generate-content', async (req, res, next) => {
   try {
     const productData = req.body;
-
     validateProductData(productData);
-
     const result = await generateAllContent(productData);
     res.json(result);
   } catch (error) {
@@ -299,11 +293,11 @@ app.post('/api/generate-content', async (req, res, next) => {
   }
 });
 
-// API Documentation
 app.get('/', (req, res) => {
   res.json({
     name: 'E-Commerce Content Automation API',
     version: '1.0.0',
+    mockMode: USE_MOCK,
     endpoints: {
       health: 'GET /health',
       generateContent: 'POST /api/generate-content',
@@ -312,10 +306,8 @@ app.get('/', (req, res) => {
   });
 });
 
-// Error handling middleware (must be last)
 app.use(errorHandler);
 
-// 404 handler
 app.use((req, res) => {
   res.status(404).json({
     error: 'Endpoint not found',
@@ -328,6 +320,7 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Mock mode: ${USE_MOCK}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
 });
 
