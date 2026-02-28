@@ -1,10 +1,18 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const axios = require('axios');
 const dotenv = require('dotenv');
 const { google } = require('googleapis');
 const OpenAI = require('openai');
+const {
+  ValidationError,
+  QuotaError,
+  GoogleSheetsError,
+  OpenAIError,
+  validateProductData,
+  validateSpreadsheetParams,
+  errorHandler,
+} = require('./error-handler');
 
 dotenv.config();
 
@@ -118,97 +126,113 @@ async function generateContent(contentType, productData) {
     
     return response.choices[0].message.content.trim();
   } catch (error) {
-    console.error(`Error generating ${contentType}:`, error);
+    // Handle OpenAI specific errors
+    if (error.status === 429) {
+      throw new QuotaError();
+    }
+    if (error.status === 401) {
+      throw new OpenAIError('Invalid OpenAI API key', 401);
+    }
+    throw new OpenAIError(`Failed to generate ${contentType}: ${error.message}`);
+  }
+}
+
+// Generate all content types for a product
+async function generateAllContent(productData) {
+  try {
+    validateProductData(productData);
+    
+    const contentTypes = ['title', 'bulletPoints', 'aContent', 'adCopy'];
+    const results = {};
+    const errors = [];
+
+    for (const contentType of contentTypes) {
+      try {
+        results[contentType] = await generateContent(contentType, productData);
+      } catch (error) {
+        errors.push({
+          contentType,
+          error: error.message,
+        });
+      }
+    }
+
+    return {
+      productName: productData.name,
+      status: errors.length === 0 ? 'success' : 'partial_success',
+      data: results,
+      errors: errors.length > 0 ? errors : undefined,
+      timestamp: new Date().toISOString(),
+    };
+  } catch (error) {
     throw error;
   }
 }
 
-// Generate all content for a product
-async function generateAllContent(productData) {
-  console.log(`Processing product: ${productData.name}`);
-  
-  try {
-    const [title, bulletPoints, aContent, adCopy] = await Promise.all([
-      generateContent('title', productData),
-      generateContent('bulletPoints', productData),
-      generateContent('aContent', productData),
-      generateContent('adCopy', productData),
-    ]);
-    
-    return {
-      sku: productData.sku,
-      productName: productData.name,
-      generatedTitle: title,
-      generatedBulletPoints: bulletPoints,
-      generatedAContent: aContent,
-      generatedAdCopy: adCopy,
-      timestamp: new Date().toISOString(),
-      status: 'success',
-    };
-  } catch (error) {
-    return {
-      sku: productData.sku,
-      productName: productData.name,
-      status: 'error',
-      error: error.message,
-      timestamp: new Date().toISOString(),
-    };
-  }
-}
-
-// Read from spreadsheet
+// Read from Google Sheets
 async function readFromSpreadsheet(spreadsheetId, range) {
   try {
-    const authClient = await auth.getClient();
     const response = await sheets.spreadsheets.values.get({
-      auth: authClient,
+      auth,
       spreadsheetId,
       range,
     });
     return response.data.values || [];
   } catch (error) {
-    console.error('Error reading spreadsheet:', error);
-    throw error;
+    throw new GoogleSheetsError(`Failed to read spreadsheet: ${error.message}`);
   }
 }
 
-// Write to spreadsheet
+// Write to Google Sheets
 async function writeToSpreadsheet(spreadsheetId, range, values) {
   try {
-    const authClient = await auth.getClient();
     await sheets.spreadsheets.values.update({
-      auth: authClient,
+      auth,
       spreadsheetId,
       range,
-      valueInputOption: 'RAW',
-      resource: { values },
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values,
+      },
     });
   } catch (error) {
-    console.error('Error writing to spreadsheet:', error);
-    throw error;
+    throw new GoogleSheetsError(`Failed to write to spreadsheet: ${error.message}`);
   }
 }
 
-// API Endpoint: Process new products
-app.post('/api/process-products', async (req, res) => {
+// API Endpoints
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  });
+});
+
+// Process products from Google Sheets
+app.post('/api/process-products', async (req, res, next) => {
   try {
-    const { spreadsheetId, inputRange, outputRange, clientId } = req.body;
-    
-    if (!spreadsheetId) {
-      return res.status(400).json({ error: 'spreadsheetId is required' });
-    }
-    
+    const { spreadsheetId, inputRange, outputRange } = req.body;
+
+    validateSpreadsheetParams({ spreadsheetId, inputRange, outputRange });
+
     // Read input data
     const rows = await readFromSpreadsheet(spreadsheetId, inputRange);
-    
+
     if (!rows || rows.length === 0) {
-      return res.json({ message: 'No new products to process', processed: 0 });
+      return res.status(400).json({
+        error: 'No data found in the specified range',
+        code: 'NO_DATA',
+        timestamp: new Date().toISOString(),
+      });
     }
-    
+
     // Skip header row
     const productRows = rows.slice(1);
     const results = [];
-    
+
     // Process each product
     for (const row of productRows) {
       const productData = {
@@ -217,78 +241,87 @@ app.post('/api/process-products', async (req, res) => {
         category: row[2],
         features: row[3],
         price: row[4],
-        audience: row[5] || '',
-        useCase: row[6] || '',
+        audience: row[5],
+        useCase: row[6],
       };
-      
-      const generatedContent = await generateAllContent(productData);
-      results.push(generatedContent);
+
+      const result = await generateAllContent(productData);
+      results.push(result);
     }
-    
-    // Prepare output
-    const outputValues = [
-      ['SKU', 'Product Name', 'Generated Title', 'Bullet Points', 'A+ Content', 'Ad Copy', 'Status', 'Timestamp'],
-      ...results.map(r => [
-        r.sku,
-        r.productName,
-        r.generatedTitle || '',
-        r.generatedBulletPoints || '',
-        r.generatedAContent || '',
-        r.generatedAdCopy || '',
-        r.status,
-        r.timestamp,
-      ]),
-    ];
-    
-    // Write results back to spreadsheet
-    await writeToSpreadsheet(spreadsheetId, outputRange, outputValues);
-    
+
+    // Prepare output data
+    const outputData = results.map((result) => [
+      result.productName,
+      result.data.title || '',
+      result.data.bulletPoints || '',
+      result.data.aContent || '',
+      result.data.adCopy || '',
+      result.status,
+      result.errors ? JSON.stringify(result.errors) : '',
+    ]);
+
+    // Add header
+    outputData.unshift([
+      'Product Name',
+      'Title',
+      'Bullet Points',
+      'A+ Content',
+      'Ad Copy',
+      'Status',
+      'Errors',
+    ]);
+
+    // Write to spreadsheet
+    await writeToSpreadsheet(spreadsheetId, outputRange, outputData);
+
     res.json({
       message: 'Products processed successfully',
-      processed: results.length,
-      results: results.map(r => ({
-        sku: r.sku,
-        status: r.status,
-        error: r.error || null,
-      })),
+      processed: productRows.length,
+      results,
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error('Error in process-products:', error);
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
-// API Endpoint: Process single product
-app.post('/api/generate-content', async (req, res) => {
+// Generate content for single product
+app.post('/api/generate-content', async (req, res, next) => {
   try {
     const productData = req.body;
-    
-    if (!productData.name || !productData.category) {
-      return res.status(400).json({ error: 'name and category are required' });
-    }
-    
+
+    validateProductData(productData);
+
     const result = await generateAllContent(productData);
     res.json(result);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Root endpoint
+// API Documentation
 app.get('/', (req, res) => {
   res.json({
-    name: 'E-commerce Content Automation API',
+    name: 'E-Commerce Content Automation API',
     version: '1.0.0',
     endpoints: {
       health: 'GET /health',
       generateContent: 'POST /api/generate-content',
       processProducts: 'POST /api/process-products',
     },
+  });
+});
+
+// Error handling middleware (must be last)
+app.use(errorHandler);
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Endpoint not found',
+    code: 'NOT_FOUND',
+    path: req.path,
+    timestamp: new Date().toISOString(),
   });
 });
 
